@@ -4,17 +4,13 @@ import runtime "base:runtime"
 import fmt "core:fmt"
 import mem "core:mem"
 import spall "core:prof/spall"
+import simd "core:simd"
 import slice "core:slice"
 import strings "core:strings"
 import sync "core:sync"
 import time "core:time"
 
-//TODO add line_cache
-//TODO get_line
-//TODO remember cursor position on undo/redo
-//maybe add cursors here?
-
-TIME_GROUPING_WINDOW :: 1000 //ms
+TIME_GROUPING_WINDOW :: 1000
 
 RBColor :: enum {
 	RED,
@@ -22,9 +18,10 @@ RBColor :: enum {
 }
 
 Piece :: struct {
-	buffer_type: Buffer_Type,
-	start:       int,
-	length:      int,
+	buffer_type:    Buffer_Type,
+	start:          int,
+	length:         int,
+	linefeed_count: int,
 }
 
 Buffer_Type :: enum {
@@ -32,30 +29,6 @@ Buffer_Type :: enum {
 	ADD,
 }
 
-RB_Node :: struct {
-	using piece:  Piece,
-	parent:       ^RB_Node,
-	left:         ^RB_Node,
-	right:        ^RB_Node,
-	color:        RBColor,
-	subtree_size: int,
-	/*
-	line_starts:   [dynamic]int, //line byte starts (0 is always start??)
-	line_count:    int, //this piece line count
-	subtree_lines: int, //subtree lines
-	*/
-}
-
-Piece_Table :: struct {
-	root:            ^RB_Node,
-	original_buffer: []u8,
-	add_buffer:      [dynamic]u8,
-	allocator:       mem.Allocator,
-	history:         [dynamic]Command,
-	history_index:   int,
-	max_history:     int,
-	grouping_time:   i64,
-}
 
 Command_Type :: enum {
 	INSERT,
@@ -69,49 +42,76 @@ Command :: struct {
 	timestamp: i64,
 }
 
+RB_Node :: struct {
+	piece:         Piece,
+	parent:        ^RB_Node,
+	left:          ^RB_Node,
+	right:         ^RB_Node,
+	color:         RBColor,
+	subtree_size:  int,
+	subtree_lines: int,
+}
+
+Piece_Table :: struct {
+	original_buffer:      []u8,
+	add_buffer:           [dynamic]u8,
+	line_starts_original: [dynamic]int,
+	line_starts_add:      [dynamic]int, // Positions of '\n' in add_buffer
+	root:                 ^RB_Node,
+	allocator:            mem.Allocator,
+	history:              [dynamic]Command,
+	history_index:        int,
+	max_history:          int,
+	grouping_time:        i64,
+}
+
+
 piece_table_init :: proc(text: string, allocator := context.allocator) -> Piece_Table {
 	text_bytes := transmute([]u8)text
 	original_copy := make([]u8, len(text_bytes), allocator)
 	copy(original_copy, text_bytes)
-
-	pt := Piece_Table {
-		original_buffer = original_copy,
-		add_buffer      = make([dynamic]u8, allocator),
-		allocator       = allocator,
-		grouping_time   = 1000,
-		history_index   = -1,
-		history         = make([dynamic]Command),
-		max_history     = 1000,
+	line_starts := make([dynamic]int, allocator)
+	append(&line_starts, 0)
+	for i in 0 ..< len(original_copy) {
+		if original_copy[i] == '\n' {
+			append(&line_starts, i + 1)
+		}
 	}
 
+
+	pt := Piece_Table {
+		original_buffer      = original_copy,
+		add_buffer           = make([dynamic]u8, allocator),
+		line_starts_original = line_starts,
+		line_starts_add      = make([dynamic]int, allocator),
+		allocator            = allocator,
+		history              = make([dynamic]Command),
+		max_history          = 1000,
+		history_index        = -1,
+		grouping_time        = 1000,
+	}
 	if len(text_bytes) > 0 {
 		piece := Piece {
 			buffer_type = .ORIGINAL,
 			start       = 0,
 			length      = len(text_bytes),
 		}
+		count_newlines_fast(&pt, &piece)
 		pt.root = rb_node_create(&pt, piece, allocator)
 		pt.root.color = .BLACK
 	}
-
+	append(&pt.line_starts_add, 0) // add-buffer start is considered a line start
+	update_metadata(pt.root)
 	return pt
 }
-
 
 piece_table_destroy :: proc(pt: ^Piece_Table) {
 	rb_tree_destroy(pt.root, pt.allocator)
 	delete(pt.history)
+	delete(pt.line_starts_original)
+	delete(pt.line_starts_add)
 	delete(pt.original_buffer, pt.allocator)
 	delete(pt.add_buffer)
-}
-
-
-rb_node_create :: proc(pt: ^Piece_Table, piece: Piece, allocator: mem.Allocator) -> ^RB_Node {
-	node := new(RB_Node, allocator)
-	node.piece = piece
-	node.color = .RED
-	node.subtree_size = piece.length
-	return node
 }
 
 
@@ -122,15 +122,40 @@ rb_tree_destroy :: proc(node: ^RB_Node, allocator: mem.Allocator) {
 	free(node, allocator)
 }
 
+rb_node_create :: proc(pt: ^Piece_Table, piece: Piece, allocator: mem.Allocator) -> ^RB_Node {
+	node := new(RB_Node, allocator)
+	node.piece = piece
+	node.color = .RED
+	node.subtree_size = node.piece.length
+	node.subtree_lines = node.piece.linefeed_count
+	return node
+}
+
+
+// update_metadata :: proc(node: ^RB_Node) {
+// 	if node == nil do return
+
+// 	node.subtree_size = node.piece.length
+// 	if node.left != nil do node.subtree_size += node.left.subtree_size
+// 	if node.right != nil do node.subtree_size += node.right.subtree_size
+
+// 	node.subtree_lines = node.piece.linefeed_count
+// 	if node.left != nil do node.subtree_lines += node.left.subtree_lines
+// 	if node.right != nil do node.subtree_lines += node.right.subtree_lines
+// }
 
 update_metadata :: proc(node: ^RB_Node) {
 	if node == nil do return
 
-	// Update subtree_size (byte count)
-	node.subtree_size = node.piece.length
-	if node.left != nil do node.subtree_size += node.left.subtree_size
-	if node.right != nil do node.subtree_size += node.right.subtree_size
+	left_size := node.left != nil ? node.left.subtree_size : 0
+	right_size := node.right != nil ? node.right.subtree_size : 0
+	left_lines := node.left != nil ? node.left.subtree_lines : 0
+	right_lines := node.right != nil ? node.right.subtree_lines : 0
+
+	node.subtree_size = left_size + node.piece.length + right_size
+	node.subtree_lines = left_lines + node.piece.linefeed_count + right_lines
 }
+
 
 update_metadata_to_root :: proc(node: ^RB_Node) {
 	node := node
@@ -140,14 +165,30 @@ update_metadata_to_root :: proc(node: ^RB_Node) {
 	}
 }
 
-/*
-Before rotate_left(x):     After:
-      x                      y
-     / \                    / \
-    a   y        -->       x   c
-       / \                / \
-      b   c              a   b
-*/
+count_newlines_fast :: proc(pt: ^Piece_Table, piece: ^Piece) {
+	if piece.length == 0 {
+		piece.linefeed_count = 0
+		return
+	}
+
+	line_starts: []int
+	switch piece.buffer_type {
+	case .ORIGINAL:
+		line_starts = pt.line_starts_original[:]
+	case .ADD:
+		line_starts = pt.line_starts_add[:]
+	}
+
+	start := piece.start
+	end := piece.start + piece.length
+
+	start_idx := binary_search_first_ge(line_starts, start + 1)
+	end_idx := binary_search_first_ge(line_starts, end + 1)
+
+	piece.linefeed_count = end_idx - start_idx
+}
+
+
 rotate_left :: proc(pt: ^Piece_Table, x: ^RB_Node) {
 	y := x.right
 	x.right = y.left
@@ -309,7 +350,7 @@ collect_affected_pieces_for_deletion :: proc(
 	}
 }
 
-
+@(private)
 replace_node :: proc(pt: ^Piece_Table, old_node, new_node: ^RB_Node) {
 	if old_node.parent == nil {
 		pt.root = new_node
@@ -323,7 +364,7 @@ replace_node :: proc(pt: ^Piece_Table, old_node, new_node: ^RB_Node) {
 		new_node.parent = old_node.parent
 	}
 }
-
+@(private)
 rb_delete_fixup :: proc(pt: ^Piece_Table, x: ^RB_Node, x_parent: ^RB_Node) {
 	x := x
 	x_parent := x_parent
@@ -421,7 +462,7 @@ rb_delete_fixup :: proc(pt: ^Piece_Table, x: ^RB_Node, x_parent: ^RB_Node) {
 		x.color = .BLACK
 	}
 }
-
+@(private)
 rb_delete_node :: proc(pt: ^Piece_Table, node_to_delete: ^RB_Node) {
 	if node_to_delete == nil do return
 
@@ -469,6 +510,7 @@ rb_delete_node :: proc(pt: ^Piece_Table, node_to_delete: ^RB_Node) {
 	free(node_to_delete, pt.allocator)
 }
 
+@(private)
 transplant :: proc(pt: ^Piece_Table, u, v: ^RB_Node) {
 	if u.parent == nil {
 		pt.root = v
@@ -483,6 +525,7 @@ transplant :: proc(pt: ^Piece_Table, u, v: ^RB_Node) {
 	}
 }
 
+@(private)
 process_piece_deletion :: proc(
 	pt: ^Piece_Table,
 	piece_info: Affected_Piece,
@@ -506,8 +549,8 @@ process_piece_deletion :: proc(
 			length      = left_length,
 		}
 		left_node = rb_node_create(pt, left_piece, pt.allocator)
+		count_newlines_fast(pt, &left_node.piece)
 	}
-
 	right_node: ^RB_Node = nil
 	if intersect_end < piece_end {
 		right_offset := intersect_end - piece_start
@@ -518,6 +561,7 @@ process_piece_deletion :: proc(
 			length      = right_length,
 		}
 		right_node = rb_node_create(pt, right_piece, pt.allocator)
+		count_newlines_fast(pt, &right_node.piece)
 	}
 
 	rb_delete_node(pt, node)
@@ -558,7 +602,7 @@ piece_table_delete_internal :: proc(pt: ^Piece_Table, position: int, length: int
 	}
 }
 
-
+@(private)
 find_min_node :: proc(node: ^RB_Node) -> ^RB_Node {
 	node := node
 	for node.left != nil {
@@ -567,6 +611,7 @@ find_min_node :: proc(node: ^RB_Node) -> ^RB_Node {
 	return node
 }
 
+@(private)
 rb_insert_node_at_position :: proc(pt: ^Piece_Table, new_node: ^RB_Node, target_position: int) {
 	if pt.root == nil {
 		pt.root = new_node
@@ -637,7 +682,7 @@ find_node_at_position :: proc(pt: ^Piece_Table, position: int) -> (^RB_Node, int
 	return nil, 0
 }
 
-
+@(private)
 copy_piece_batch :: proc(
 	node: ^RB_Node,
 	start_offset: int,
@@ -662,55 +707,6 @@ copy_piece_batch :: proc(
 }
 
 
-piece_table_insert_internal :: proc(pt: ^Piece_Table, position: int, text: string) {
-	if len(text) == 0 do return
-
-	start_pos := len(pt.add_buffer)
-	text_bytes := transmute([]u8)text
-	append(&pt.add_buffer, ..text_bytes)
-
-	new_piece := Piece {
-		buffer_type = .ADD,
-		start       = start_pos,
-		length      = len(text_bytes),
-	}
-
-	if pt.root == nil {
-		pt.root = rb_node_create(pt, new_piece, pt.allocator)
-		pt.root.color = .BLACK
-		return
-	}
-
-	insert_node, split_offset := find_insert_position(pt, position)
-
-	if split_offset > 0 && split_offset < insert_node.piece.length {
-		old_piece := insert_node.piece
-
-		right_piece := Piece {
-			buffer_type = old_piece.buffer_type,
-			start       = old_piece.start + split_offset,
-			length      = old_piece.length - split_offset,
-		}
-		insert_node.piece.length = split_offset
-
-		// Create nodes
-		new_node := rb_node_create(pt, new_piece, pt.allocator)
-		right_node := rb_node_create(pt, right_piece, pt.allocator)
-
-		rb_insert_node_at_position(pt, new_node, position)
-
-		rb_insert_node_at_position(pt, right_node, position + len(text_bytes))
-		//TODO this is probably overkill?
-		update_metadata_to_root(insert_node)
-		update_metadata_to_root(new_node)
-		update_metadata_to_root(right_node)
-	} else {
-		new_node := rb_node_create(pt, new_piece, pt.allocator)
-		rb_insert_node_at_position(pt, new_node, position)
-		update_metadata_to_root(new_node)
-	}
-}
-
 piece_table_insert :: proc(pt: ^Piece_Table, position: int, text: string) {
 	// Record for undo
 	cmd := Command {
@@ -720,9 +716,7 @@ piece_table_insert :: proc(pt: ^Piece_Table, position: int, text: string) {
 		timestamp = get_current_time(),
 	}
 	add_command(pt, cmd)
-
 	piece_table_insert_internal(pt, position, text)
-
 }
 
 
@@ -739,54 +733,10 @@ piece_table_delete :: proc(pt: ^Piece_Table, position: int, length: int) {
 		timestamp = get_current_time(),
 	}
 	add_command(pt, cmd)
-	free_all(context.allocator)
 	piece_table_delete_internal(pt, position, length)
 }
 
-piece_table_substring :: proc(
-	pt: ^Piece_Table,
-	start: int,
-	length: int,
-	allocator := context.allocator,
-) -> string {
-	if length <= 0 || start < 0 {
-		return ""
-	}
 
-	result := make([dynamic]u8, allocator)
-
-	remaining := length
-	pos := start
-
-	for remaining > 0 {
-		node, offset := find_node_at_position(pt, pos)
-		if node == nil {
-			break
-		}
-
-		available := node.length - offset
-		to_read := min(remaining, available)
-
-		buffer: []u8
-		switch node.buffer_type {
-		case .ORIGINAL:
-			buffer = pt.original_buffer
-		case .ADD:
-			buffer = pt.add_buffer[:]
-		}
-
-		piece_start := node.start + offset
-		piece_end := piece_start + to_read
-		append(&result, ..buffer[piece_start:piece_end])
-
-		remaining -= to_read
-		pos += to_read
-	}
-	return string(result[:])
-}
-
-
-//undo redo
 piece_table_undo :: proc(pt: ^Piece_Table) -> bool {
 	if pt.history_index < 0 do return false
 
@@ -819,11 +769,11 @@ piece_table_redo :: proc(pt: ^Piece_Table) -> bool {
 
 	return true
 }
-
+@(private)
 get_current_time :: proc() -> i64 {
 	return time.to_unix_nanoseconds(time.now()) / 1000000
 }
-
+@(private)
 add_command :: proc(pt: ^Piece_Table, cmd: Command) {
 	cmd := cmd
 
@@ -851,7 +801,6 @@ add_command :: proc(pt: ^Piece_Table, cmd: Command) {
 		text      = strings.clone(cmd.text, pt.allocator),
 		timestamp = cmd.timestamp,
 	}
-	defer delete(cmd_copy.text)
 	append(&pt.history, cmd_copy)
 	pt.history_index = len(pt.history) - 1
 
@@ -860,7 +809,7 @@ add_command :: proc(pt: ^Piece_Table, cmd: Command) {
 		pt.history_index -= 1
 	}
 }
-
+@(private)
 can_group_commands :: proc(prev, curr: ^Command) -> bool {
 	if prev.type != curr.type do return false
 	if curr.timestamp - prev.timestamp > TIME_GROUPING_WINDOW do return false // 1 second grouping window
@@ -875,54 +824,385 @@ can_group_commands :: proc(prev, curr: ^Command) -> bool {
 	return false
 }
 
-get_line :: proc(table: ^Piece_Table, line_number: int) -> (line: string, ok: bool) {
-	if line_number < 0 {
-		return "", false
+
+piece_table_substring :: proc(
+	pt: ^Piece_Table,
+	start: int,
+	length: int,
+	allocator := context.allocator,
+) -> string {
+	if length <= 0 || start < 0 {
+		return ""
 	}
 
-	current_line := 0
-	builder := strings.builder_make(table.allocator)
-	defer if current_line != line_number do strings.builder_destroy(&builder)
+	result := make_dynamic_array([dynamic]u8, allocator)
 
-	node := table.root
-	stack: [dynamic]^RB_Node
-	defer delete(stack)
+	remaining := length
+	pos := start
 
-	for node != nil || len(stack) > 0 {
-		for node != nil {
-			append(&stack, node)
-			node = node.left
+	for remaining > 0 {
+		node, offset := find_node_at_position(pt, pos)
+		if node == nil {
+			break
 		}
 
-		node = pop(&stack)
+		available := node.piece.length - offset
+		to_read := min(remaining, available)
 
-		text := get_piece_text(table, &node.piece)
+		buffer: []u8
+		switch node.piece.buffer_type {
+		case .ORIGINAL:
+			buffer = pt.original_buffer
+		case .ADD:
+			buffer = pt.add_buffer[:]
+		}
 
-		for b in text {
-			if current_line == line_number {
-				strings.write_byte(&builder, b)
+		piece_start := node.piece.start + offset
+		piece_end := piece_start + to_read
+		append(&result, ..buffer[piece_start:piece_end])
 
-				if b == '\n' {
-					return strings.to_string(builder), true
-				}
-			} else if b == '\n' {
-				current_line += 1
+		remaining -= to_read
+		pos += to_read
+	}
+	return string(result[:])
+}
 
-				if current_line > line_number {
-					return "", false
-				}
+@(private)
+piece_table_insert_internal :: proc(pt: ^Piece_Table, position: int, text: string) {
+	if len(text) == 0 do return
+
+	start_pos := len(pt.add_buffer)
+	text_bytes := transmute([]u8)text
+
+	for i := 0; i < len(text_bytes); i += 1 {
+		if text_bytes[i] == '\n' {
+			append(&pt.line_starts_add, start_pos + i + 1)
+		}
+	}
+
+	append(&pt.add_buffer, ..text_bytes)
+
+
+	new_piece := Piece {
+		buffer_type = .ADD,
+		start       = start_pos,
+		length      = len(text_bytes),
+	}
+	count_newlines_fast(pt, &new_piece)
+
+	if pt.root == nil {
+		pt.root = rb_node_create(pt, new_piece, pt.allocator)
+		pt.root.color = .BLACK
+		return
+	}
+
+	insert_node, split_offset := find_insert_position(pt, position)
+	if split_offset > 0 && split_offset < insert_node.piece.length {
+		old_piece := insert_node.piece
+		right_piece := Piece {
+			buffer_type = old_piece.buffer_type,
+			start       = old_piece.start + split_offset,
+			length      = old_piece.length - split_offset,
+		}
+		count_newlines_fast(pt, &right_piece)
+
+		insert_node.piece.length = split_offset
+
+		count_newlines_fast(pt, &insert_node.piece)
+		count_newlines_fast(pt, &right_piece)
+
+		new_node := rb_node_create(pt, new_piece, pt.allocator)
+		right_node := rb_node_create(pt, right_piece, pt.allocator)
+
+		rb_insert_node_at_position(pt, new_node, position)
+		rb_insert_node_at_position(pt, right_node, position + len(text_bytes))
+
+		update_metadata_to_root(insert_node)
+	} else {
+		new_node := rb_node_create(pt, new_piece, pt.allocator)
+		rb_insert_node_at_position(pt, new_node, position)
+	}
+}
+
+find_piece_at_position :: proc(
+	table: ^Piece_Table,
+	pos: int,
+) -> (
+	node: ^RB_Node,
+	offset_in_piece: int,
+	ok: bool,
+) {
+	if table.root == nil {
+		return nil, 0, false
+	}
+
+	current := table.root
+	pos_before := 0
+
+	for current != nil {
+		left_size := current.left != nil ? current.left.subtree_size : 0
+		node_start := pos_before + left_size
+		node_end := node_start + current.piece.length
+
+		if pos < node_start {
+			current = current.left
+		} else if pos >= node_end {
+			pos_before = node_end
+			current = current.right
+		} else {
+			// Found it
+			return current, pos - node_start, true
+		}
+	}
+
+	return nil, 0, false
+}
+
+get_successor :: proc(node: ^RB_Node) -> ^RB_Node {
+	if node == nil {
+		return nil
+	}
+	if node.right != nil {
+		current := node.right
+		for current.left != nil {
+			current = current.left
+		}
+		return current
+	}
+	current := node
+	parent := current.parent
+	for parent != nil && current == parent.right {
+		current = parent
+		parent = parent.parent
+	}
+
+	return parent
+}
+
+read_until_newline :: proc(
+	table: ^Piece_Table,
+	start_pos: int,
+	allocator := context.allocator,
+) -> (
+	line: string,
+	line_end_pos: int,
+) {
+	if table.root == nil {
+		return "", start_pos
+	}
+
+	builder := strings.builder_make(allocator)
+
+	current_pos := start_pos
+	node, offset_in_piece, ok := find_piece_at_position(table, start_pos)
+
+	if !ok {
+		strings.builder_destroy(&builder)
+		return "", start_pos
+	}
+
+	for node != nil {
+		buffer := node.piece.buffer_type == .ORIGINAL ? table.original_buffer : table.add_buffer[:]
+
+		start_in_buffer := node.piece.start + offset_in_piece
+		end_in_buffer := node.piece.start + node.piece.length
+
+		found_newline := false
+		newline_pos := start_in_buffer
+
+		for i := start_in_buffer; i < end_in_buffer; i += 1 {
+			if buffer[i] == '\n' {
+				newline_pos = i + 1
+				found_newline = true
+				break
 			}
 		}
 
-		node = node.right
+		if found_newline {
+			strings.write_bytes(&builder, buffer[start_in_buffer:newline_pos])
+			bytes_read := newline_pos - start_in_buffer
+			return strings.to_string(builder), current_pos + bytes_read
+		} else {
+			strings.write_bytes(&builder, buffer[start_in_buffer:end_in_buffer])
+			bytes_read := end_in_buffer - start_in_buffer
+			current_pos += bytes_read
+		}
+
+		node = get_successor(node)
+		offset_in_piece = 0
 	}
 
-	if current_line == line_number && strings.builder_len(builder) > 0 {
-		return strings.to_string(builder), true
-	}
-
-	return "", false
+	return strings.to_string(builder), current_pos
 }
+
+find_nth_newline_position :: proc(table: ^Piece_Table, n: int) -> int {
+	if n < 0 || table.root == nil {
+		return -1
+	}
+
+	node := table.root
+	newlines_before := 0
+	pos_before := 0
+
+	for node != nil {
+		left_newlines := node.left != nil ? node.left.subtree_lines : 0
+		left_size := node.left != nil ? node.left.subtree_size : 0
+
+		if n < newlines_before + left_newlines {
+			node = node.left
+		} else if n < newlines_before + left_newlines + node.piece.linefeed_count {
+			newline_offset := n - (newlines_before + left_newlines)
+
+			line_starts :=
+				node.piece.buffer_type == .ORIGINAL ? table.line_starts_original[:] : table.line_starts_add[:]
+
+			first_idx := binary_search_first_ge(line_starts, node.piece.start + 1)
+			target_idx := first_idx + newline_offset
+
+			if target_idx >= len(line_starts) {
+				return -1
+			}
+
+			buffer_pos := line_starts[target_idx]
+
+			offset_in_piece := buffer_pos - node.piece.start
+			doc_position := pos_before + left_size + offset_in_piece
+
+			return doc_position
+		} else {
+			newlines_before += left_newlines + node.piece.linefeed_count
+			pos_before += left_size + node.piece.length
+			node = node.right
+		}
+	}
+
+	return -1
+}
+
+get_line_number_from_offset :: proc(table: ^Piece_Table, offset: int) -> int {
+	if table.root == nil || offset < 0 {
+		return -1
+	}
+	node := table.root
+	pos_before := 0
+	lines_before := 0
+
+	for node != nil {
+		left_lines := node.left != nil ? node.left.subtree_lines : 0
+		left_size := node.left != nil ? node.left.subtree_size : 0
+		piece_start := pos_before + left_size
+		piece_end := piece_start + node.piece.length
+
+		if offset < piece_start {
+			node = node.left
+		} else if offset < piece_end {
+			buffer :=
+				node.piece.buffer_type == .ORIGINAL ? table.original_buffer : table.add_buffer[:]
+			piece_offset := offset - piece_start
+			buffer_start := node.piece.start
+			buffer_end := node.piece.start + piece_offset
+
+			line_count_in_piece := 0
+			for i := node.piece.start; i < buffer_end; i += 1 {
+				if buffer[i] == '\n' {
+					line_count_in_piece += 1
+				}
+			}
+
+			return lines_before + left_lines + line_count_in_piece
+		} else {
+			lines_before += left_lines + node.piece.linefeed_count
+			pos_before += left_size + node.piece.length
+			node = node.right
+		}
+	}
+
+
+	total_lines := table.root.subtree_lines
+	return total_lines
+}
+
+
+get_line_offset_range :: proc(
+	table: ^Piece_Table,
+	line_number: int,
+) -> (
+	start_pos: int,
+	end_pos: int,
+	ok: bool,
+) {
+	if line_number < 0 || table.root == nil {
+		return 0, 0, false
+	}
+
+	if line_number == 0 {
+		start_pos = 0
+	} else {
+		start_pos = find_nth_newline_position(table, line_number - 1)
+		if start_pos < 0 {
+			return 0, 0, false
+		}
+	}
+
+	next_newline_pos := find_nth_newline_position(table, line_number)
+	if next_newline_pos < 0 {
+		total_size := table.root.subtree_size
+		return start_pos, total_size, true
+	}
+
+	// The newline itself is not part of the line content, so exclude it
+	return start_pos, next_newline_pos, true
+}
+
+
+get_line :: proc(
+	table: ^Piece_Table,
+	line_number: int,
+	allocator := context.allocator,
+) -> (
+	string,
+	bool,
+) {
+	if line_number < 0 || table.root == nil {
+		return "", false
+	}
+
+	start_pos: int
+
+	if line_number == 0 {
+		start_pos = 0
+	} else {
+		start_pos = find_nth_newline_position(table, line_number - 1)
+		if start_pos < 0 {
+			return "", false
+		}
+	}
+
+	line, _ := read_until_newline(table, start_pos, allocator)
+	return line, true
+}
+
+get_line_count :: proc(table: ^Piece_Table) -> int {
+	if table.root == nil {
+		return 0
+	}
+	return table.root.subtree_lines + 1
+}
+
+
+binary_search_first_ge :: proc(a: []int, x: int) -> int {
+	lo, hi := 0, len(a)
+	#no_bounds_check for lo < hi {
+		mid := (lo + hi) / 2
+		if a[mid] < x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
 
 get_piece_text :: proc(table: ^Piece_Table, piece: ^Piece) -> []u8 {
 	if piece.buffer_type == .ORIGINAL {
@@ -933,17 +1213,8 @@ get_piece_text :: proc(table: ^Piece_Table, piece: ^Piece) -> []u8 {
 }
 
 main :: proc() {
-	table := piece_table_init(#load("../test_files/unicode_test.odin"))
-	defer piece_table_destroy(&table)
-	piece_table_insert(&table, 0, "a")
-	piece_table_insert(&table, 1, "b")
-	piece_table_insert(&table, 2, "c")
-	piece_table_insert(&table, 3, "d")
-	piece_table_insert(&table, 4, "e")
-	piece_table_insert(&table, 5, "f\n\n")
-	piece_table_insert(&table, 7, "g")
-
-	fmt.print("*************\n")
-	fmt.println(piece_table_substring(&table, 0, table.root.subtree_size))
-	fmt.println("*************")
+	pt := piece_table_init(#load("text_test_file.txt"))
+	defer piece_table_destroy(&pt)
+	run_all_tests()
+	run_all_benchmarks()
 }
