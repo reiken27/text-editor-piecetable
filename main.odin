@@ -1,9 +1,10 @@
 package main
 
+import c "core:c"
 import fmt "core:fmt"
 import mem "core:mem"
-import os "core:os"
 import os2 "core:os/os2"
+import slice "core:slice"
 import strings "core:strings"
 import time "core:time"
 import utf8 "core:unicode/utf8"
@@ -20,6 +21,10 @@ Cursor :: struct {
 	cursor_color:      rl.Color,
 	desired_col_runes: int,
 	has_desired_col:   bool,
+	selection_start:   int,
+	selection_active:  bool,
+	marker_position:   int,
+	marker_active:     bool,
 }
 
 Editor :: struct {
@@ -36,6 +41,8 @@ Editor :: struct {
 	status_bar_height: f32,
 	line_number_width: f32,
 	show_line_numbers: bool,
+	using treesitter:  Treesitter_tree,
+	should_recenter:   bool, // flag to trigger recentering
 }
 
 editor_init :: proc(
@@ -49,7 +56,7 @@ editor_init :: proc(
 	editor.scroll_offset_y = 0
 	editor.scroll_offset_x = 0
 	editor.font_size = 20
-	editor.line_height = f32(editor.font_size) * 1
+	editor.line_height = f32(editor.font_size) * 1.2
 	editor.cursor_visible = true
 	editor.viewport_width = SCREEN_WIDTH
 	editor.viewport_height = SCREEN_HEIGHT
@@ -61,6 +68,7 @@ editor_init :: proc(
 	ok := load_file(editor, filename)
 	if !ok do return
 	editor.file_name = filename
+	treesitter_init(editor)
 }
 
 editor_cleanup :: proc(editor: ^Editor) {
@@ -70,12 +78,11 @@ editor_cleanup :: proc(editor: ^Editor) {
 	}
 }
 
-
 load_file :: proc(editor: ^Editor, filename: string) -> bool {
 	editor := editor
-	data, ok := os.read_entire_file(filename)
+	data, err := os2.read_entire_file_from_path(filename, context.allocator)
 	defer delete(data)
-	if !ok {
+	if err != nil {
 		fmt.printf("Failed to read file: %s\n", filename)
 		return false
 	}
@@ -89,7 +96,7 @@ load_unicode_font :: proc(custom_font_path: string = "") -> rl.Font {
 		cstring_path := strings.clone_to_cstring(custom_font_path)
 		defer delete(cstring_path)
 		//need to figure out how to load codepoints properly (dynamically?)in order to support unicode
-		font := rl.LoadFontEx(cstring_path, 20, nil, 0)
+		font := rl.LoadFontEx(cstring_path, 40, nil, 0)
 
 		if font.texture.id != 0 {
 			fmt.printf("Loaded custom Unicode font: %s\n", custom_font_path)
@@ -102,102 +109,18 @@ load_unicode_font :: proc(custom_font_path: string = "") -> rl.Font {
 }
 
 
-handle_input :: proc(editor: ^Editor) {
-	input_buffer: [dynamic]u8
-	defer delete(input_buffer)
-
-
-	key := rl.GetCharPressed()
-	for key > 0 {
-		if key >= 32 {
-			buf, bytes_written := utf8.encode_rune(key)
-			if bytes_written > 0 {
-				append(&input_buffer, ..buf[:bytes_written])
-			}
-		}
-		key = rl.GetCharPressed()
-	}
-
-	if len(input_buffer) > 0 {
-		text := string(input_buffer[:])
-		insert_text(editor, text)
-	}
-
-	if rl.IsKeyDown(.LEFT_CONTROL) || rl.IsKeyDown(.RIGHT_CONTROL) {
-		if rl.IsKeyDown(.LEFT_SHIFT) || rl.IsKeyDown(.LEFT_SHIFT) {
-
-		} else {
-			if rl.IsKeyPressed(.RIGHT) {
-				move_word_forward(editor)
-				line, col := line_col_from_cursor(editor)
-				a, ok := ptree.get_line(&editor.table, line)
-				fmt.println(transmute([]u8)a)
-			}
-			if rl.IsKeyPressed(.LEFT) {
-				move_word_backward(editor)
-			}
-		}
-	}
-
-
-	if (rl.IsKeyPressedRepeat(.ENTER) || rl.IsKeyPressed(.ENTER)) {
-		insert_text(editor, "\n")
-	}
-	if rl.IsKeyPressedRepeat(.TAB) || rl.IsKeyPressed(.TAB) {
-		insert_text(editor, "\t")
-	}
-
-	if rl.IsKeyPressedRepeat(.BACKSPACE) || rl.IsKeyPressed(.BACKSPACE) {
-		delete_text(editor, forward = false)
-	}
-
-	if rl.IsKeyPressedRepeat(.DELETE) || rl.IsKeyPressed(.DELETE) {
-		delete_text(editor, forward = true)
-	}
-
-	if rl.IsKeyPressedRepeat(.LEFT) || rl.IsKeyPressed(.LEFT) {
-		move_left(editor)
-	}
-	if rl.IsKeyPressedRepeat(.RIGHT) || rl.IsKeyPressed(.RIGHT) {
-		move_right(editor)
-	}
-	if rl.IsKeyPressedRepeat(.UP) || rl.IsKeyPressed(.UP) {
-		move_up(editor)
-	}
-	if rl.IsKeyPressedRepeat(.DOWN) || rl.IsKeyPressed(.DOWN) {
-		move_down(editor)
-	}
-	if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyPressed(.Z) {
-		result := ptree.piece_table_undo(&editor.table)
-		fmt.println("undo", result)
-	}
-	if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyPressed(.Y) {
-		result := ptree.piece_table_redo(&editor.table) // Changed from undo
-		fmt.println("redo", result)
-	}
-
-	if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyPressed(.S) {
-		result := save_file(editor)
-		fmt.println("saved at:", editor.file_name)
-	}
-	if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyPressed(.G) {
-		go_to_line(editor, 500 - 1)
-	}
-	// Toggle line numbers
-	if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyPressed(.L) {
-		editor.show_line_numbers = !editor.show_line_numbers
-	}
-
-}
-
 save_file :: proc(editor: ^Editor) -> bool {
-	// TODO: i can probably make this much faster
-	file, err := os.open(editor.file_name, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, 0)
+
+	file, err := os2.open(
+		editor.file_name,
+		os2.O_WRONLY | os2.O_CREATE | os2.O_TRUNC,
+		os2.Permissions_Default,
+	)
 	if err != nil {
 		fmt.println("Failed to open file for writing:", err)
 		return false
 	}
-	defer os.close(file)
+	defer os2.close(file)
 
 	pt := &editor.table
 	total := pt.root.subtree_size
@@ -227,7 +150,7 @@ save_file :: proc(editor: ^Editor) -> bool {
 		data := buffer[piece_start:piece_end]
 
 		// write this chunk
-		written, err := os.write(file, data)
+		written, err := os2.write(file, data)
 		if err != nil || written != len(data) {
 			fmt.println("Write failed:", err)
 			return false
@@ -238,282 +161,6 @@ save_file :: proc(editor: ^Editor) -> bool {
 	}
 
 	return true
-}
-
-
-move_left :: proc(editor: ^Editor) {
-	if editor.cursor.position > 0 {
-		backtrack := min(editor.cursor.position, 4)
-		text := ptree.piece_table_substring(
-			&editor.table,
-			editor.cursor.position - backtrack,
-			backtrack,
-		)
-		defer delete(text)
-
-		if len(text) > 0 {
-			r, size := utf8.decode_last_rune_in_string(text)
-			if r != utf8.RUNE_ERROR {
-				editor.cursor.position -= size
-			} else {
-				editor.cursor.position -= 1
-			}
-		}
-	}
-
-	line, col := line_col_from_cursor(editor)
-	editor.cursor.desired_col_runes = col
-	editor.cursor.has_desired_col = false
-}
-
-
-move_right :: proc(editor: ^Editor) {
-	if editor.cursor.position < editor.table.root.subtree_size {
-		remaining := editor.table.root.subtree_size - editor.cursor.position
-		if remaining > 0 {
-			text := ptree.piece_table_substring(
-				&editor.table,
-				editor.cursor.position,
-				min(remaining, 4),
-			)
-			defer delete(text)
-
-			if len(text) > 0 {
-				r, size := utf8.decode_rune_in_string(text)
-				if r != utf8.RUNE_ERROR {
-					editor.cursor.position += size
-				} else {
-					editor.cursor.position += 1
-				}
-			}
-		}
-	}
-
-	line, col := line_col_from_cursor(editor)
-	editor.cursor.desired_col_runes = col
-	editor.cursor.has_desired_col = false
-}
-
-move_up :: proc(editor: ^Editor) {
-	line, col := line_col_from_cursor(editor)
-
-	if line == 0 {
-		editor.cursor.position = 0
-		return
-	}
-
-	prev_line, ok := ptree.get_line(&editor.table, line - 1)
-	if !ok {
-		return
-	}
-	defer delete(prev_line)
-
-	start_pos, end_pos, off_ok := ptree.get_line_offset_range(&editor.table, line - 1)
-	if !off_ok {
-		return
-	}
-
-	if !editor.cursor.has_desired_col {
-		editor.cursor.desired_col_runes = col
-		editor.cursor.has_desired_col = true
-	}
-
-	target_col := editor.cursor.desired_col_runes
-	rune_count := utf8.rune_count(prev_line)
-
-	if target_col > rune_count {
-		target_col = rune_count
-	}
-
-	byte_offset := 0
-	if target_col > 0 {
-		byte_offset = utf8.rune_offset(prev_line, target_col)
-	}
-
-	editor.cursor.position = start_pos + byte_offset
-}
-
-
-move_down :: proc(editor: ^Editor) {
-	line, col := line_col_from_cursor(editor)
-
-	next_line, ok := ptree.get_line(&editor.table, line + 1)
-	if !ok {
-		return
-	}
-	defer delete(next_line)
-
-	start_pos, end_pos, off_ok := ptree.get_line_offset_range(&editor.table, line + 1)
-	if !off_ok {
-		return
-	}
-
-	if !editor.cursor.has_desired_col {
-		editor.cursor.desired_col_runes = col
-		editor.cursor.has_desired_col = true
-	}
-
-	target_col := editor.cursor.desired_col_runes
-	rune_count := utf8.rune_count(next_line)
-
-	if target_col >= rune_count {
-		target_col = rune_count - 1
-		if target_col < 0 {
-			target_col = 0
-		}
-	}
-
-	byte_offset := utf8.rune_offset(next_line, target_col)
-	if byte_offset < 0 {
-		byte_offset = 0
-	}
-
-	editor.cursor.position = start_pos + byte_offset
-}
-
-move_word_backward :: proc(editor: ^Editor) {
-	if editor.cursor.position == 0 {
-		return
-	}
-
-	pos := editor.cursor.position
-	step := 32
-	in_whitespace := true
-
-	loop: for pos > 0 {
-		backtrack := min(pos, step)
-		text := ptree.piece_table_substring(
-			&editor.table,
-			pos - backtrack,
-			backtrack,
-			context.temp_allocator,
-		)
-		i := len(text)
-
-		for i > 0 {
-			r, size := utf8.decode_last_rune_in_string(text[:i])
-			i -= size
-
-			is_space := (r == ' ' || r == '\n' || r == '\t' || r == '\r')
-
-			if in_whitespace {
-				// keep skipping whitespace
-				if !is_space {
-					in_whitespace = false
-				}
-			} else {
-				// now inside a word — stop when we hit whitespace
-				if is_space {
-					pos = (pos - backtrack) + (i + size)
-					break loop
-				}
-			}
-		}
-
-		pos -= backtrack
-	}
-
-	// clamp and update cursor
-	editor.cursor.position = clamp(pos, 0, editor.table.root.subtree_size)
-	line, col := line_col_from_cursor(editor)
-	editor.cursor.desired_col_runes = col
-	editor.cursor.has_desired_col = false
-}
-
-move_word_forward :: proc(editor: ^Editor) {
-	total_size := editor.table.root.subtree_size
-	if editor.cursor.position >= total_size {
-		return
-	}
-
-	pos := editor.cursor.position
-	step := 32
-	in_word := false
-	in_whitespace := true
-
-	loop: for pos < total_size {
-		remaining := total_size - pos
-		read_len := min(remaining, step)
-		text := ptree.piece_table_substring(&editor.table, pos, read_len, context.temp_allocator)
-
-		i := 0
-		for i < len(text) {
-			r, size := utf8.decode_rune_in_string(text[i:])
-			is_space := (r == ' ' || r == '\n' || r == '\t' || r == '\r' || r == 10)
-
-			if in_whitespace {
-				if !is_space {
-					in_whitespace = false
-					in_word = true
-				}
-			} else if in_word {
-				// stop when we hit next whitespace
-				if is_space {
-					pos += i - 1
-					break loop
-				}
-			}
-
-			i += size
-		}
-
-		pos += read_len
-	}
-
-	editor.cursor.position = clamp(pos, 0, total_size)
-	line, col := line_col_from_cursor(editor)
-	editor.cursor.desired_col_runes = col
-	editor.cursor.has_desired_col = false
-}
-
-
-insert_text :: proc(editor: ^Editor, text: string) {
-	if len(text) == 0 do return
-	ptree.piece_table_insert(&editor.table, editor.cursor.position, text)
-	editor.cursor.position += len(text)
-	editor.cursor.has_desired_col = false
-}
-
-delete_text :: proc(editor: ^Editor, forward: bool) {
-	if forward {
-		if editor.cursor.position < editor.table.root.subtree_size {
-			remaining := editor.table.root.subtree_size - editor.cursor.position
-			text := ptree.piece_table_substring(
-				&editor.table,
-				editor.cursor.position,
-				min(remaining, 4),
-			)
-			defer delete(text)
-
-			if len(text) > 0 {
-				r, size := utf8.decode_rune_in_string(text)
-				if r != utf8.RUNE_ERROR {
-					ptree.piece_table_delete(&editor.table, editor.cursor.position, size)
-				}
-			}
-		}
-	} else {
-		if editor.cursor.position > 0 {
-			text := ptree.piece_table_substring(&editor.table, 0, editor.cursor.position)
-			defer delete(text)
-
-			if len(text) > 0 {
-				last_rune_start := 0
-				last_rune_size := 0
-
-				byte_pos := 0
-				for r in text {
-					last_rune_start = byte_pos
-					last_rune_size = utf8.rune_size(r)
-					byte_pos += last_rune_size
-				}
-
-				ptree.piece_table_delete(&editor.table, last_rune_start, last_rune_size)
-				editor.cursor.position = last_rune_start
-			}
-		}
-	}
-	editor.cursor.has_desired_col = false
 }
 
 
@@ -550,34 +197,86 @@ line_col_from_cursor :: proc(editor: ^Editor) -> (line: int, col_runes: int) {
 
 	return line_num, col_runes
 }
-
-
-go_to_line :: proc(editor: ^Editor, line: int) {
-	line := line
-	if line < 0 {
-		line = 0
+line_col_from_position :: proc(editor: ^Editor, position: int) -> (line: int, col_runes: int) {
+	if position <= 0 {
+		return 0, 0
 	}
-
-	total_lines := editor.table.root.subtree_lines
-	if line > total_lines {
-		line = total_lines
-	}
-
-	start_pos, _, ok := ptree.get_line_offset_range(&editor.table, line)
+	line_num := ptree.get_line_number_from_offset(&editor.table, position)
+	//TODO add function to do this without string building
+	line_str, ok := ptree.get_line(&editor.table, line_num)
+	defer delete(line_str)
 	if !ok {
-		return
+		return 0, 0
+	}
+	start_pos, _, ok2 := ptree.get_line_offset_range(&editor.table, line_num)
+	if !ok2 {
+		return 0, 0
+	}
+	// Compute column as rune offset within the line
+	byte_offset_in_line := position - start_pos // Changed from editor.cursor.position
+	col_runes = 0
+	total_bytes := 0
+	for r in line_str {
+		rune_bytes := utf8.rune_size(r)
+		if total_bytes + rune_bytes > byte_offset_in_line {
+			break
+		}
+		total_bytes += rune_bytes
+		col_runes += 1
+	}
+	return line_num, col_runes
+}
+
+draw_debug_cursor :: proc(editor: ^Editor, position: int, color: rl.Color) {
+	// Convert position -> line / column
+	line, col_runes := line_col_from_position(editor, position)
+
+	cursor_y := f32(line) * editor.line_height
+	cursor_x: f32 = 0.0
+
+	if line < editor.table.root.subtree_lines {
+		line_text, ok := ptree.get_line(&editor.table, line)
+		defer delete(line_text)
+
+		if ok && col_runes > 0 {
+			if col_runes <= strings.rune_count(line_text) {
+				rune_idx := 0
+				for _, byte_idx in line_text {
+					if rune_idx == col_runes {
+						prefix := line_text[:byte_idx]
+						cprefix := strings.clone_to_cstring(prefix, context.temp_allocator)
+						size := rl.MeasureTextEx(editor.font, cprefix, f32(editor.font_size), 0)
+						cursor_x = size.x
+						break
+					}
+					rune_idx += 1
+				}
+
+				if rune_idx == strings.rune_count(line_text) {
+					cline := strings.clone_to_cstring(line_text, context.temp_allocator)
+					size := rl.MeasureTextEx(editor.font, cline, f32(editor.font_size), 0)
+					cursor_x = size.x
+				}
+			}
+		}
 	}
 
-	editor.cursor.position = start_pos
-	editor.cursor.has_desired_col = false
+	// Account for scrolling + line numbers
+	text_offset_x: f32 = 0
+	if editor.show_line_numbers {
+		text_offset_x = editor.line_number_width
+	}
+
+	screen_x := text_offset_x + cursor_x - editor.scroll_offset_x
+	screen_y := cursor_y - editor.scroll_offset_y
+
+	// Draw cursor rectangle
+	rl.DrawRectangle(i32(screen_x), i32(screen_y), 2, editor.font_size, color)
 }
 
 
-render_editor :: proc(editor: ^Editor) {
-	editor.viewport_width = f32(rl.GetScreenWidth())
-	editor.viewport_height = f32(rl.GetScreenHeight())
+recenter_camera_on_cursor :: proc(editor: ^Editor) {
 	cursor_line, cursor_col_runes := line_col_from_cursor(editor)
-
 	cursor_y: f32 = f32(cursor_line) * editor.line_height
 	cursor_x: f32 = 0.0
 
@@ -586,7 +285,6 @@ render_editor :: proc(editor: ^Editor) {
 		defer delete(line_text)
 
 		if ok && cursor_col_runes > 0 {
-			// Measure text up to cursor position
 			if cursor_col_runes <= strings.rune_count(line_text) {
 				rune_idx := 0
 				for r, byte_idx in line_text {
@@ -607,7 +305,6 @@ render_editor :: proc(editor: ^Editor) {
 					}
 					rune_idx += 1
 				}
-				// If cursor is past the end of the line, measure the whole line
 				if rune_idx == strings.rune_count(line_text) {
 					cstring_line := strings.clone_to_cstring(line_text, context.temp_allocator)
 					text_size := rl.MeasureTextEx(
@@ -621,28 +318,93 @@ render_editor :: proc(editor: ^Editor) {
 			}
 		}
 	}
-	// Vertical scrolling
-	if cursor_y < editor.scroll_offset_y {
-		editor.scroll_offset_y = cursor_y
-	} else if cursor_y >= editor.scroll_offset_y + editor.viewport_height - editor.line_height {
-		editor.scroll_offset_y = cursor_y - editor.viewport_height + editor.line_height
+
+	// Vertical scrolling - center the cursor line on screen
+	editor.scroll_offset_y = cursor_y - (editor.viewport_height / 2.0)
+
+	// Clamp to prevent scrolling past the document bounds
+	if editor.scroll_offset_y < 0 {
+		editor.scroll_offset_y = 0
 	}
 
-	// Horizontal scrolling
+	max_scroll :=
+		f32(editor.table.root.subtree_lines) * editor.line_height - editor.viewport_height
+	if max_scroll > 0 && editor.scroll_offset_y > max_scroll {
+		editor.scroll_offset_y = max_scroll
+	}
+
+	// Horizontal scrolling - center the cursor horizontally
 	available_width := editor.viewport_width
 	if editor.show_line_numbers {
 		available_width -= editor.line_number_width
 	}
 
-	if cursor_x < editor.scroll_offset_x {
-		editor.scroll_offset_x = cursor_x
-	} else if cursor_x >= editor.scroll_offset_x + available_width {
-		editor.scroll_offset_x = cursor_x - available_width
+	editor.scroll_offset_x = cursor_x - (available_width / 2.0)
+
+	// Clamp horizontal scroll to prevent negative offset
+	if editor.scroll_offset_x < 0 {
+		editor.scroll_offset_x = 0
+	}
+}
+
+
+render_editor :: proc(editor: ^Editor) {
+	editor.viewport_width = f32(rl.GetScreenWidth())
+	editor.viewport_height = f32(rl.GetScreenHeight())
+	cursor_line, cursor_col_runes := line_col_from_cursor(editor)
+
+	// Only recenter if flag is set
+	if editor.should_recenter {
+		recenter_camera_on_cursor(editor)
+		editor.should_recenter = false
+	}
+
+	// Calculate cursor position for rendering (but don't update scroll)
+	cursor_y: f32 = f32(cursor_line) * editor.line_height
+	cursor_x: f32 = 0.0
+
+	if cursor_line < editor.table.root.subtree_lines {
+		line_text, ok := ptree.get_line(&editor.table, cursor_line)
+		defer delete(line_text)
+
+		if ok && cursor_col_runes > 0 {
+			if cursor_col_runes <= strings.rune_count(line_text) {
+				rune_idx := 0
+				for r, byte_idx in line_text {
+					if rune_idx == cursor_col_runes {
+						line_prefix := line_text[:byte_idx]
+						cstring_prefix := strings.clone_to_cstring(
+							line_prefix,
+							context.temp_allocator,
+						)
+						text_size := rl.MeasureTextEx(
+							editor.font,
+							cstring_prefix,
+							f32(editor.font_size),
+							0,
+						)
+						cursor_x = text_size.x
+						break
+					}
+					rune_idx += 1
+				}
+				if rune_idx == strings.rune_count(line_text) {
+					cstring_line := strings.clone_to_cstring(line_text, context.temp_allocator)
+					text_size := rl.MeasureTextEx(
+						editor.font,
+						cstring_line,
+						f32(editor.font_size),
+						0,
+					)
+					cursor_x = text_size.x
+				}
+			}
+		}
 	}
 
 	render_text(editor)
 
-	// Draw cursor
+	// Draw cursor (even if offscreen)
 	if editor.cursor_visible {
 		text_offset_x: f32 = 0
 		if editor.show_line_numbers {
@@ -655,7 +417,15 @@ render_editor :: proc(editor: ^Editor) {
 		rl.DrawRectangle(i32(cursor_screen_x), i32(cursor_screen_y), 2, editor.font_size, rl.GREEN)
 	}
 
-	// Status bar - display 1-indexed
+	if editor.selection_active {
+		draw_debug_cursor(editor, editor.selection_start, rl.RED)
+	}
+
+	if editor.marker_active {
+		draw_debug_cursor(editor, editor.marker_position, rl.ORANGE)
+	}
+
+	// Status bar
 	status_y := editor.viewport_height
 	rl.DrawRectangle(
 		0,
@@ -667,12 +437,13 @@ render_editor :: proc(editor: ^Editor) {
 
 	line_nums_status := editor.show_line_numbers ? "ON" : "OFF"
 	status_text := fmt.aprintf(
-		"Position: %d | Line: %d, Col: %d | Line Numbers: %s | Ctrl+S: Save, Ctrl+L: Toggle Line Numbers | desired: %d",
+		"Position: %d | Line: %d, Col: %d | Line Numbers: %s | Ctrl+S: Save, Ctrl+L: Toggle Line Numbers | selection: %d %t",
 		editor.cursor.position,
 		cursor_line + 1,
 		cursor_col_runes + 1,
 		line_nums_status,
-		editor.cursor.desired_col_runes,
+		editor.selection_start,
+		editor.selection_active,
 	)
 	defer delete(status_text)
 	cstring_status := strings.clone_to_cstring(status_text, context.temp_allocator)
@@ -680,7 +451,7 @@ render_editor :: proc(editor: ^Editor) {
 		editor.font,
 		cstring_status,
 		{10, status_y - editor.status_bar_height},
-		30,
+		cast(f32)editor.font_size,
 		0,
 		rl.GRAY,
 	)
@@ -723,6 +494,7 @@ render_text :: proc(editor: ^Editor) {
 		y := f32(line_idx) * line_height - editor.scroll_offset_y
 
 		line_text, _ := ptree.get_line(&editor.table, line_idx)
+
 		defer delete(line_text)
 
 		// Remove trailing newline before rendering
@@ -760,6 +532,7 @@ render_text :: proc(editor: ^Editor) {
 
 }
 
+
 main :: proc() {
 	when ODIN_DEBUG {
 		track: mem.Tracking_Allocator
@@ -776,24 +549,26 @@ main :: proc() {
 		}
 	}
 
-	args := os.args
+	args := os2.args
 	if len(args) < 2 {
 		fmt.println("Usage: raylib-editor <filename>")
 		return
 	}
+
+
 	filename := args[1]
 	rl.SetConfigFlags(rl.ConfigFlags{.WINDOW_RESIZABLE})
 	rl.InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, rl.TextFormat("HM-EDITOR: %s", filename))
 	defer rl.CloseWindow()
-	rl.SetTargetFPS(75)
+	rl.SetTargetFPS(100000)
 	editor: Editor
 	editor_init(&editor, "./NotoSansJP-Regular.ttf", filename)
 	defer editor_cleanup(&editor)
 
-	for !rl.WindowShouldClose() {
-		handle_input(&editor)
 
+	for !rl.WindowShouldClose() {
 		rl.BeginDrawing()
+		handle_input(&editor)
 		rl.ClearBackground(rl.Color{25, 25, 25, 255})
 		render_editor(&editor)
 		rl.DrawText(

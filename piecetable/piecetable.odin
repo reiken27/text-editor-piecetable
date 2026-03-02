@@ -4,11 +4,11 @@ import runtime "base:runtime"
 import fmt "core:fmt"
 import mem "core:mem"
 import spall "core:prof/spall"
-import simd "core:simd"
 import slice "core:slice"
 import strings "core:strings"
-import sync "core:sync"
 import time "core:time"
+
+//TODO test if adding bitflags like ascii_only, has_emotes, bidi in the pieces would help
 
 TIME_GROUPING_WINDOW :: 1000
 
@@ -36,10 +36,10 @@ Command_Type :: enum {
 }
 
 Command :: struct {
-	type:      Command_Type,
+	timestamp: i64,
 	position:  int,
 	text:      string,
-	timestamp: i64,
+	type:      Command_Type,
 }
 
 RB_Node :: struct {
@@ -78,7 +78,6 @@ piece_table_init :: proc(text: string, allocator := context.allocator) -> Piece_
 		}
 	}
 
-
 	pt := Piece_Table {
 		original_buffer      = original_copy,
 		add_buffer           = make([dynamic]u8, allocator),
@@ -96,12 +95,55 @@ piece_table_init :: proc(text: string, allocator := context.allocator) -> Piece_
 			start       = 0,
 			length      = len(text_bytes),
 		}
-		count_newlines_fast(&pt, &piece)
+		count_newlines(&pt, &piece)
 		pt.root = rb_node_create(&pt, piece, allocator)
 		pt.root.color = .BLACK
 	}
 	append(&pt.line_starts_add, 0) // add-buffer start is considered a line start
 	update_metadata(pt.root)
+	return pt
+}
+
+piece_table_init_borrowed :: proc(
+	original_buffer: []u8,
+	allocator := context.allocator,
+) -> Piece_Table {
+
+	line_starts := make([dynamic]int, allocator)
+	append(&line_starts, 0)
+
+	for i in 0 ..< len(original_buffer) {
+		if original_buffer[i] == '\n' {
+			append(&line_starts, i + 1)
+		}
+	}
+
+	pt := Piece_Table {
+		original_buffer      = original_buffer, // <-- borrowed
+		add_buffer           = make([dynamic]u8, allocator),
+		line_starts_original = line_starts,
+		line_starts_add      = make([dynamic]int, allocator),
+		allocator            = allocator,
+		history              = make([dynamic]Command),
+		max_history          = 1000,
+		history_index        = -1,
+		grouping_time        = 1000,
+	}
+
+	if len(original_buffer) > 0 {
+		piece := Piece {
+			buffer_type = .ORIGINAL,
+			start       = 0,
+			length      = len(original_buffer),
+		}
+		count_newlines(&pt, &piece)
+		pt.root = rb_node_create(&pt, piece, allocator)
+		pt.root.color = .BLACK
+	}
+
+	append(&pt.line_starts_add, 0)
+	update_metadata(pt.root)
+
 	return pt
 }
 
@@ -131,19 +173,6 @@ rb_node_create :: proc(pt: ^Piece_Table, piece: Piece, allocator: mem.Allocator)
 	return node
 }
 
-
-// update_metadata :: proc(node: ^RB_Node) {
-// 	if node == nil do return
-
-// 	node.subtree_size = node.piece.length
-// 	if node.left != nil do node.subtree_size += node.left.subtree_size
-// 	if node.right != nil do node.subtree_size += node.right.subtree_size
-
-// 	node.subtree_lines = node.piece.linefeed_count
-// 	if node.left != nil do node.subtree_lines += node.left.subtree_lines
-// 	if node.right != nil do node.subtree_lines += node.right.subtree_lines
-// }
-
 update_metadata :: proc(node: ^RB_Node) {
 	if node == nil do return
 
@@ -165,7 +194,7 @@ update_metadata_to_root :: proc(node: ^RB_Node) {
 	}
 }
 
-count_newlines_fast :: proc(pt: ^Piece_Table, piece: ^Piece) {
+count_newlines :: proc(pt: ^Piece_Table, piece: ^Piece) {
 	if piece.length == 0 {
 		piece.linefeed_count = 0
 		return
@@ -549,7 +578,7 @@ process_piece_deletion :: proc(
 			length      = left_length,
 		}
 		left_node = rb_node_create(pt, left_piece, pt.allocator)
-		count_newlines_fast(pt, &left_node.piece)
+		count_newlines(pt, &left_node.piece)
 	}
 	right_node: ^RB_Node = nil
 	if intersect_end < piece_end {
@@ -561,7 +590,7 @@ process_piece_deletion :: proc(
 			length      = right_length,
 		}
 		right_node = rb_node_create(pt, right_piece, pt.allocator)
-		count_newlines_fast(pt, &right_node.piece)
+		count_newlines(pt, &right_node.piece)
 	}
 
 	rb_delete_node(pt, node)
@@ -888,7 +917,7 @@ piece_table_insert_internal :: proc(pt: ^Piece_Table, position: int, text: strin
 		start       = start_pos,
 		length      = len(text_bytes),
 	}
-	count_newlines_fast(pt, &new_piece)
+	count_newlines(pt, &new_piece)
 
 	if pt.root == nil {
 		pt.root = rb_node_create(pt, new_piece, pt.allocator)
@@ -904,12 +933,12 @@ piece_table_insert_internal :: proc(pt: ^Piece_Table, position: int, text: strin
 			start       = old_piece.start + split_offset,
 			length      = old_piece.length - split_offset,
 		}
-		count_newlines_fast(pt, &right_piece)
+		count_newlines(pt, &right_piece)
 
 		insert_node.piece.length = split_offset
 
-		count_newlines_fast(pt, &insert_node.piece)
-		count_newlines_fast(pt, &right_piece)
+		count_newlines(pt, &insert_node.piece)
+		count_newlines(pt, &right_piece)
 
 		new_node := rb_node_create(pt, new_piece, pt.allocator)
 		right_node := rb_node_create(pt, right_piece, pt.allocator)
@@ -1213,8 +1242,8 @@ get_piece_text :: proc(table: ^Piece_Table, piece: ^Piece) -> []u8 {
 }
 
 main :: proc() {
-	pt := piece_table_init(#load("text_test_file.txt"))
+	pt := piece_table_init(#load("kjv.txt"))
 	defer piece_table_destroy(&pt)
-	run_all_tests()
+	//run_all_tests()
 	run_all_benchmarks()
 }

@@ -9,6 +9,7 @@ Test_Result :: struct {
 	message: string,
 }
 
+
 test_results: [dynamic]Test_Result
 
 @(private)
@@ -81,7 +82,7 @@ test_single_line_with_newline :: proc() {
 
 	line0, ok0 := get_line(&pt, 0)
 	assert_true("get_line(0) succeeds", ok0)
-	assert_equal("Line 0 content", "hello world", line0)
+	assert_equal("Line 0 content", "hello world\n", line0)
 
 	line1, ok1 := get_line(&pt, 1)
 	assert_true("get_line(1) succeeds", ok1)
@@ -98,10 +99,10 @@ test_multiple_lines :: proc() {
 	assert_true("3 lines total", line_count == 3, fmt.tprintf("Got %d lines", line_count))
 
 	line0, _ := get_line(&pt, 0)
-	assert_equal("Line 0", "line 0", line0)
+	assert_equal("Line 0", "line 0\n", line0)
 
 	line1, _ := get_line(&pt, 1)
-	assert_equal("Line 1", "line 1", line1)
+	assert_equal("Line 1", "line 1\n", line1)
 
 	line2, _ := get_line(&pt, 2)
 	assert_equal("Line 2", "line 2", line2)
@@ -117,13 +118,13 @@ test_empty_lines :: proc() {
 	assert_true("4 lines total", line_count == 4, fmt.tprintf("Got %d lines", line_count))
 
 	line0, _ := get_line(&pt, 0)
-	assert_equal("Line 0", "first", line0)
+	assert_equal("Line 0", "first\n", line0)
 
 	line1, _ := get_line(&pt, 1)
-	assert_equal("Line 1 (empty)", "", line1)
+	assert_equal("Line 1 (empty)", "\n", line1)
 
 	line2, _ := get_line(&pt, 2)
-	assert_equal("Line 2", "third", line2)
+	assert_equal("Line 2", "third\n", line2)
 
 	line3, _ := get_line(&pt, 3)
 	assert_equal("Line 3 (empty)", "", line3)
@@ -140,7 +141,7 @@ test_insert_at_start :: proc() {
 	assert_true("Still 2 lines", line_count == 2, fmt.tprintf("Got %d lines", line_count))
 
 	line0, _ := get_line(&pt, 0)
-	assert_equal("Line 0 after insert", "hello world", line0)
+	assert_equal("Line 0 after insert", "hello world\n", line0)
 }
 
 test_insert_at_end :: proc() {
@@ -179,7 +180,7 @@ test_insert_newline :: proc() {
 	assert_true("Now 2 lines", line_count == 2, fmt.tprintf("Got %d lines", line_count))
 
 	line0, _ := get_line(&pt, 0)
-	assert_equal("Line 0", "hello", line0)
+	assert_equal("Line 0", "hello\n", line0)
 
 	line1, _ := get_line(&pt, 1)
 	assert_equal("Line 1", " world", line1)
@@ -196,13 +197,13 @@ test_insert_multiple_lines :: proc() {
 	assert_true("Now 4 lines", line_count == 4, fmt.tprintf("Got %d lines", line_count))
 
 	line0, _ := get_line(&pt, 0)
-	assert_equal("Line 0", "first", line0)
+	assert_equal("Line 0", "first\n", line0)
 
 	line1, _ := get_line(&pt, 1)
-	assert_equal("Line 1", "middle1", line1)
+	assert_equal("Line 1", "middle1\n", line1)
 
 	line2, _ := get_line(&pt, 2)
-	assert_equal("Line 2", "middle2", line2)
+	assert_equal("Line 2", "middle2\n", line2)
 
 	line3, _ := get_line(&pt, 3)
 	assert_equal("Line 3", "last", line3)
@@ -226,16 +227,16 @@ test_complex_inserts :: proc() {
 	assert_true("5 lines total", line_count == 5, fmt.tprintf("Got %d lines", line_count))
 
 	line0, _ := get_line(&pt, 0)
-	assert_equal("Line 0", "line0", line0)
+	assert_equal("Line 0", "line0\n", line0)
 
 	line1, _ := get_line(&pt, 1)
-	assert_equal("Line 1", "line1", line1)
+	assert_equal("Line 1", "line1\n", line1)
 
 	line2, _ := get_line(&pt, 2)
-	assert_equal("Line 2", "line2", line2)
+	assert_equal("Line 2", "line2\n", line2)
 
 	line3, _ := get_line(&pt, 3)
-	assert_equal("Line 3", "line3", line3)
+	assert_equal("Line 3", "line3\n", line3)
 
 	line4, _ := get_line(&pt, 4)
 	assert_equal("Line 4", "line4", line4)
@@ -250,10 +251,10 @@ test_unicode :: proc() {
 	assert_true("3 lines with unicode", line_count == 3, fmt.tprintf("Got %d lines", line_count))
 
 	line0, _ := get_line(&pt, 0)
-	assert_equal("Unicode line 0", "Hello 世界", line0)
+	assert_equal("Unicode line 0", "Hello 世界\n", line0)
 
 	line1, _ := get_line(&pt, 1)
-	assert_equal("Unicode line 1", "Γεια σου κόσμε", line1)
+	assert_equal("Unicode line 1", "Γεια σου κόσμε\n", line1)
 }
 
 test_long_line :: proc() {

@@ -36,7 +36,6 @@ debug_print_piece :: proc(pt: ^Piece_Table, piece: ^Piece, label: string = "") {
 	fmt.printf("Line start indices: start_idx=%d, end_idx=%d\n", start_idx, end_idx)
 	fmt.printf("Line starts in range: %v\n", line_starts[start_idx:end_idx])
 	fmt.printf("Calculated line_count: %d\n", end_idx - start_idx)
-
 }
 
 debug_print_tree :: proc(pt: ^Piece_Table, node: ^RB_Node, depth: int = 0) {
@@ -155,7 +154,6 @@ benchmark_sequential_deletes :: proc(pt: ^Piece_Table, count: int) {
 }
 
 benchmark_random_inserts :: proc(pt: ^Piece_Table, count: int) {
-
 	time1 := time.tick_now()
 	for i in 0 ..< count {
 		pos := rand.int31_max(i32(pt.root.subtree_size))
@@ -248,34 +246,38 @@ benchmark_end_inserts :: proc(pt: ^Piece_Table, count: int) {
 	)
 }
 
-benchmark_get_random_lines :: proc(pt: ^Piece_Table, count: int) {
-
-	total_lines := pt.root.subtree_lines
-	time1 := time.tick_now()
-	for i in 0 ..< count {
-		line_num := rand.int31_max(i32(total_lines))
-		_, _ = get_line(pt, int(line_num))
-	}
-	time2 := time.tick_now()
-	timedif := time.tick_diff(time1, time2)
-	fmt.printf(
-		"Random line reads (%d ops): %v (%.2f µs/op)\n",
-		count,
-		timedif,
-		f64(time.duration_microseconds(timedif)) / f64(count),
-	)
-}
 
 benchmark_get_all_lines :: proc(pt: ^Piece_Table) {
 	total_lines := pt.root.subtree_lines
 	time1 := time.tick_now()
 	for i in 0 ..< total_lines {
-		_, _ = get_line(pt, i)
+		get_line(pt, i)
 	}
 	time2 := time.tick_now()
 	timedif := time.tick_diff(time1, time2)
 	fmt.printf(
 		"Sequential line reads (%d lines): %v (%.2f µs/line)\n",
+		total_lines,
+		timedif,
+		f64(time.duration_microseconds(timedif)) / f64(total_lines),
+	)
+}
+
+benchmark_get_line_ranges :: proc(pt: ^Piece_Table) {
+	total_lines := pt.root.subtree_lines
+	time1 := time.tick_now()
+	dummy: int
+	for i in 0 ..< total_lines {
+		start, end, ok := get_line_offset_range(pt, i)
+		if ok {
+			dummy += end - start
+		}
+	}
+	fmt.println("dummy", dummy)
+	time2 := time.tick_now()
+	timedif := time.tick_diff(time1, time2)
+	fmt.printf(
+		"Line offset reads (%d lines): %v (%.2f µs/line)\n",
 		total_lines,
 		timedif,
 		f64(time.duration_microseconds(timedif)) / f64(total_lines),
@@ -318,83 +320,150 @@ benchmark_pathological_splits :: proc(pt: ^Piece_Table, count: int) {
 	)
 }
 
+benchmark_get_line_after_edits :: proc(pt: ^Piece_Table, insert_count: int, line_reads: int) {
+	// First, perform many random inserts to fragment the tree
+	line_reads := line_reads
+	fmt.printf("  Performing %d random inserts to fragment tree...\n", insert_count)
+	for i in 0 ..< insert_count {
+		pos := rand.int31_max(i32(pt.root.subtree_size))
+		piece_table_insert(pt, int(pos), "fragmentation\n")
+	}
+
+	total_lines := pt.root.subtree_lines
+	if line_reads > total_lines {
+		line_reads = total_lines
+	}
+
+	fmt.printf("  Tree now has %d lines, reading %d lines...\n", total_lines, line_reads)
+
+	// Now benchmark get_line performance on the fragmented tree
+	time1 := time.tick_now()
+	for i in 0 ..< line_reads {
+		line_idx := rand.int31_max(i32(total_lines))
+		_, _ = get_line(pt, int(line_idx))
+	}
+	time2 := time.tick_now()
+	timedif := time.tick_diff(time1, time2)
+	fmt.printf(
+		"  Random line reads after edits (%d reads): %v (%.2f µs/read)\n",
+		line_reads,
+		timedif,
+		f64(time.duration_microseconds(timedif)) / f64(line_reads),
+	)
+}
+
 run_all_benchmarks :: proc() {
 	fmt.println("\n=== PIECE TABLE BENCHMARKS ===\n")
 
 	// Warmup and initial setup
-	pt := piece_table_init(#load("100k"))
+	pt := piece_table_init(#load("kjv.txt"))
 	defer piece_table_destroy(&pt)
 
 	fmt.printf("Initial size: %d bytes, %d lines\n\n", pt.root.subtree_size, pt.root.subtree_lines)
 
 	// Basic operations
-	fmt.println("--- Basic Operations (1_000_000 ops) ---")
+	fmt.println("--- Basic Operations (100_000 ops) ---")
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_sequential_inserts(&pt_temp, 1_000_000)
+		benchmark_sequential_inserts(&pt_temp, 100_000)
 	}
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_sequential_deletes(&pt_temp, 1_000_000)
+		benchmark_sequential_deletes(&pt_temp, 100_000)
 	}
 
 	// Random operations
-	fmt.println("\n--- Random Operations (1_000_000 ops) ---")
+	fmt.println("\n--- Random Operations (100_000 ops) ---")
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_random_inserts(&pt_temp, 1_000_000)
+		benchmark_random_inserts(&pt_temp, 100_000)
 	}
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_random_deletes(&pt_temp, 1_000_000)
+		benchmark_random_deletes(&pt_temp, 100_000)
 	}
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_mixed_operations(&pt_temp, 1_000_000)
+		benchmark_mixed_operations(&pt_temp, 100_000)
 	}
 
 	// Position-specific operations
-	fmt.println("\n--- Position-Specific Operations (1_000_000 ops) ---")
+	fmt.println("\n--- Position-Specific Operations (100_000 ops) ---")
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_front_inserts(&pt_temp, 1_000_000)
+		benchmark_front_inserts(&pt_temp, 100_000)
 	}
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_end_inserts(&pt_temp, 1_000_000)
+		benchmark_end_inserts(&pt_temp, 100_000)
 	}
 
 	// Line reading
 	fmt.println("\n--- Line Reading ---")
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
 		benchmark_get_all_lines(&pt_temp)
-		benchmark_get_random_lines(&pt_temp, 1_000_000)
+	}
+
+	// Line reading after fragmentation
+	fmt.println("\n--- Line Reading After Fragmentation ---")
+	fmt.println("Baseline (fresh tree):")
+	{
+		pt_temp := piece_table_init(#load("kjv.txt"))
+		defer piece_table_destroy(&pt_temp)
+		benchmark_get_all_lines(&pt_temp)
+	}
+	fmt.println("\nAfter 10,000 random inserts:")
+	{
+		pt_temp := piece_table_init(#load("kjv.txt"))
+		defer piece_table_destroy(&pt_temp)
+		benchmark_get_line_after_edits(&pt_temp, 10_000, 50_000)
+	}
+	fmt.println("\nAfter 100,000 random inserts:")
+	{
+		pt_temp := piece_table_init(#load("kjv.txt"))
+		defer piece_table_destroy(&pt_temp)
+		benchmark_get_line_after_edits(&pt_temp, 100_000, 50_000)
+	}
+	fmt.println("\nAfter 500,000 random inserts:")
+	{
+		pt_temp := piece_table_init(#load("kjv.txt"))
+		defer piece_table_destroy(&pt_temp)
+		benchmark_get_line_after_edits(&pt_temp, 500_000, 50_000)
 	}
 
 	// Large operations
-	fmt.println("\n--- Large Text Operations (1_000_000 ops) ---")
+	fmt.println("\n--- Large Text Operations (100_000 ops) ---")
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_large_inserts(&pt_temp, 1_000_000)
+		benchmark_large_inserts(&pt_temp, 100_000)
 	}
 
 	// Pathological cases
-	fmt.println("\n--- Stress Tests (1_000_000 ops) ---")
+	fmt.println("\n--- Stress Tests (100_000 ops) ---")
 	{
-		pt_temp := piece_table_init(#load("100k"))
+		pt_temp := piece_table_init(#load("kjv.txt"))
 		defer piece_table_destroy(&pt_temp)
-		benchmark_pathological_splits(&pt_temp, 1_000_000)
+		benchmark_pathological_splits(&pt_temp, 100_000)
 	}
+
+	//Line offset reads
+	fmt.println("\n--- Line offsets (all lines) ---")
+	{
+		pt_temp := piece_table_init(#load("kjv.txt"))
+		defer piece_table_destroy(&pt_temp)
+		benchmark_get_line_ranges(&pt_temp)
+	}
+
 
 	fmt.println("\n=== BENCHMARKS COMPLETE ===")
 }
